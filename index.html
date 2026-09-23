@@ -663,15 +663,24 @@
             let backgroundRestartAttempts = 0;
             let backgroundModeEnabled = false;
 
-            // 新增：重启锁 & 心跳
+            // 重启锁 & 心跳
             let isRestarting = false;
             let heartbeatTimer = null;
-            const HEARTBEAT_INTERVAL = 60 * 1000; // 60 秒主动重启一次
+            const HEARTBEAT_INTERVAL = 25 * 1000; // 25 秒主动重启一次
 
-            // 新增：翻译串行队列
+            // 看门狗：长时间无识别结果时强制重启
+            let watchdogTimer = null;
+            let lastResultTime = Date.now();
+            const WATCHDOG_TIMEOUT = 15000; // 15 秒无结果强制重启
+
+            // 翻译串行队列
             let translateQueue = Promise.resolve();
             let lastTranslatedText = '';
             let lastTranslationResult = '';
+
+            // Interim UI 节流
+            let interimBuffer = '';
+            let interimThrottleTimer = null;
 
             const uiTexts = {
                 'zh-CN': {
@@ -844,6 +853,38 @@
 
                 lastTranslatedText = '';
                 lastTranslationResult = '';
+            }
+
+            // ============================================================
+            // 看门狗：长时间无识别结果时强制重启
+            // ============================================================
+            function startWatchdog() {
+                stopWatchdog();
+                lastResultTime = Date.now();
+                watchdogTimer = setInterval(() => {
+                    if (!isRecording) return;
+                    const gap = Date.now() - lastResultTime;
+                    if (gap > WATCHDOG_TIMEOUT) {
+                        console.warn(`看门狗触发：${gap}ms 无识别结果，强制重启`);
+                        lastResultTime = Date.now();
+                        try {
+                            if (activeRecognition) {
+                                activeRecognition.abort();
+                            } else {
+                                scheduleRestart();
+                            }
+                        } catch (e) {
+                            scheduleRestart();
+                        }
+                    }
+                }, 5000);
+            }
+
+            function stopWatchdog() {
+                if (watchdogTimer) {
+                    clearInterval(watchdogTimer);
+                    watchdogTimer = null;
+                }
             }
 
             function startBackgroundCheck() {
@@ -1066,12 +1107,28 @@
             }
 
             // ============================================================
+            // Interim UI 节流：100ms 一次，避免 DOM 阻塞
+            // ============================================================
+            function scheduleInterimUI(text) {
+                interimBuffer = text;
+                if (interimThrottleTimer) return;
+                interimThrottleTimer = setTimeout(() => {
+                    interimThrottleTimer = null;
+                    const t = interimBuffer;
+                    if (!t) return;
+                    const texts = uiTexts[currentUILang];
+                    recognitionResult.textContent = t + ` (${currentUILang === 'zh-CN' ? '识别中...' : '認識中...'})`;
+                    subtitleText.textContent = t;
+                    fullscreenSubtitle.textContent = t;
+                }, 100);
+            }
+
+            // ============================================================
             // 语音识别：每次新建实例，避免状态冲突
             // ============================================================
             function initSpeechRecognition() {
                 if (!checkBrowserSupport()) return;
 
-                // 先销毁旧实例
                 if (activeRecognition) {
                     try {
                         activeRecognition.onend = null;
@@ -1107,9 +1164,11 @@
                     startBackgroundCheck();
                     startInactivityTimer();
                     startHeartbeat();
+                    startWatchdog();
                 };
 
                 rec.onresult = function(event) {
+                    lastResultTime = Date.now();
                     startInactivityTimer();
 
                     let interimTranscript = '';
@@ -1125,15 +1184,10 @@
                     }
 
                     if (finalTranscript) {
-                        recognitionResult.innerHTML = finalTranscript;
+                        recognitionResult.textContent = finalTranscript;
                         translateText(finalTranscript, true);
                     } else if (interimTranscript) {
-                        const texts = uiTexts[currentUILang];
-                        recognitionResult.innerHTML = interimTranscript +
-                            `<span style="color:#aaa"> (${currentUILang === 'zh-CN' ? '识别中...' : '認識中...'})</span>`;
-                        subtitleText.textContent = interimTranscript;
-                        fullscreenSubtitle.textContent = interimTranscript;
-                        translateInterimText(interimTranscript);
+                        scheduleInterimUI(interimTranscript);
                     }
                 };
 
@@ -1170,6 +1224,7 @@
 
                 rec.onend = function() {
                     isRecognitionRunning = false;
+                    stopWatchdog();
 
                     if (!isRecording) {
                         const texts = uiTexts[currentUILang];
@@ -1213,6 +1268,7 @@
                     stopBackgroundCheck();
                     stopInactivityTimer();
                     stopHeartbeat();
+                    stopWatchdog();
                     return;
                 }
 
@@ -1229,7 +1285,7 @@
             }
 
             // ============================================================
-            // 心跳：每 60 秒主动重启一次，防止长跑卡死
+            // 心跳：每 25 秒主动重启一次
             // ============================================================
             function startHeartbeat() {
                 stopHeartbeat();
@@ -1238,7 +1294,6 @@
                     console.log('心跳重启语音识别');
                     try {
                         if (activeRecognition) {
-                            // 触发 onend -> scheduleRestart
                             activeRecognition.abort();
                         } else {
                             scheduleRestart();
@@ -1274,7 +1329,6 @@
                 const texts = uiTexts[currentUILang];
                 status.textContent = texts.statusTranslating;
 
-                // 去重
                 if (text === lastTranslatedText && lastTranslationResult) {
                     translationResult.textContent = lastTranslationResult;
                     translationText.textContent = lastTranslationResult;
@@ -1382,9 +1436,10 @@
 
                     if (activeRecognition) {
                         try {
-                            activeRecognition.onend = null; // 防止触发 restart
+                            activeRecognition.onend = null;
                             activeRecognition.onerror = null;
                             activeRecognition.onresult = null;
+                            activeRecognition.onstart = null;
                             activeRecognition.abort();
                             activeRecognition = null;
                             recognition = null;
@@ -1408,7 +1463,7 @@
             // 开始/停止识别
             recordBtn.addEventListener('click', function() {
                 if (!isRecording) {
-                    isRecording = true; // 先置为 true，让 scheduleRestart 生效
+                    isRecording = true;
                     isRestarting = false;
                     restartAttempts = 0;
                     initSpeechRecognition();
@@ -1419,6 +1474,7 @@
                         stopBackgroundCheck();
                         stopInactivityTimer();
                         stopHeartbeat();
+                        stopWatchdog();
                     } catch (e) {
                         console.error('停止识别失败:', e);
                     }
